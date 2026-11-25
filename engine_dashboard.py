@@ -6,19 +6,20 @@ import uuid, sqlite3, queue
 from pathlib import Path
 
 # Firebase Realtime Database configuration
-FIREBASE_URL = "https://dbel-65121-default-rtdb.europe-west1.firebasedatabase.app/"
+FIREBASE_URL = "PASTE_REALTIME_DATABASE_URL_HERE"
 FIREBASE_KEY = Path(__file__).resolve().with_name("dbel.json")  # Service account JSON beside this script
 TRAIN_ID = "train_001"
 LIVE_INTERVAL = 0.5  # seconds; latest state, not a new history entry each time
 OUTBOX_FILE = Path(__file__).resolve().with_name("firebase_outbox.sqlite3")
 cloud_queue = queue.SimpleQueue()
-cloud_status = "STARTING"
+cloud_status = "CONNECTING"
+cloud_last_success = None
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 def cloud_worker():
-    global cloud_status
+    global cloud_status, cloud_last_success
     try:
         con = sqlite3.connect(OUTBOX_FILE)
         con.execute("CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
@@ -82,10 +83,11 @@ def cloud_worker():
                             state["stale"] = not online
                         updates[f"live_data/coach_{cid}"] = state
                     ref.update(updates)
+                    cloud_last_success = time.monotonic()
+                    if cloud_status != "ONLINE":
+                        print("[Firebase] CONNECTED — live data upload confirmed", flush=True)
+                    cloud_status = "ONLINE"
                     next_live = time.monotonic() + LIVE_INTERVAL
-                if cloud_status != "ONLINE":
-                    print("[Firebase] Connected; live data and events syncing", flush=True)
-                cloud_status = "ONLINE"
             except Exception as exc:
                 cloud_status = "OFFLINE / RETRYING"
                 print(f"[Firebase] {type(exc).__name__}: {exc}", flush=True)
@@ -272,6 +274,11 @@ class Dashboard:
         color = RED if critical else AMBER if len(online)<2 or warning else GREEN
         rect(8,31,W-8,59,CARD); txt(15,45,status,12,color,bold=True)
         txt(W-15,45,f'{len(online)}/2',12,color,'e',True)
+        db_status = cloud_status
+        if db_status == "ONLINE" and (cloud_last_success is None or time.monotonic()-cloud_last_success > 10):
+            db_status = "UPLOAD DELAYED"
+        db_label = "CONNECTED" if db_status == "ONLINE" else db_status
+        db_color = GREEN if db_status == "ONLINE" else AMBER if db_status in ("CONNECTING", "UPLOAD DELAYED") else RED
         if self.page == 'live':
             for i in (1,2):
                 if portrait: x,y,cw,ch = 8,66+(i-1)*182,W-16,174
@@ -290,11 +297,11 @@ class Dashboard:
                     txt(x+cw-13,yy,value,15,col,'e',True)
                 port = data[i]['port'].split('/')[-1] if on else f'ttyUSB{i-1} / No data'
                 txt(x+9,y+ch-10,port,10,MUTED)
-                if i == 2: txt(x+cw-9,y+ch-10,"DB: OK" if cloud_status == "ONLINE" else "DB: WAIT",9,GREEN if cloud_status == "ONLINE" else AMBER,"e")
+            txt(W/2,H-45,"FIREBASE: "+db_label,11,db_color,"center",True)
         else:
             self.rows = max(1,(H-145)//24)
             self.offset = min(self.offset,max(0,len(events)-1))
-            txt(10,77,'EVENTS | DB: '+cloud_status,11,CYAN,bold=True)
+            txt(10,77,'EVENTS | DB: '+db_label,11,db_color,bold=True)
             if not events: txt(12,108,'No events yet',12,MUTED)
             for j,(stamp,cid,msg) in enumerate(events[self.offset:self.offset+self.rows]):
                 yy=98+j*24
