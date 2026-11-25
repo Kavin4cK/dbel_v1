@@ -1,7 +1,97 @@
 import tkinter as tk
 import serial, threading, json, time, math
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
+import uuid, sqlite3, queue
+from pathlib import Path
+
+# Firebase Realtime Database configuration
+FIREBASE_URL = "PASTE_REALTIME_DATABASE_URL_HERE"
+FIREBASE_KEY = Path(__file__).resolve().with_name("dbel.json")  # Service account JSON beside this script
+TRAIN_ID = "train_001"
+LIVE_INTERVAL = 0.5  # seconds; latest state, not a new history entry each time
+OUTBOX_FILE = Path(__file__).resolve().with_name("firebase_outbox.sqlite3")
+cloud_queue = queue.SimpleQueue()
+cloud_status = "STARTING"
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def cloud_worker():
+    global cloud_status
+    try:
+        con = sqlite3.connect(OUTBOX_FILE)
+        con.execute("CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        con.commit()
+    except Exception as exc:
+        cloud_status = "LOCAL STORAGE ERROR"
+        print(f"[Firebase] Local storage error: {exc}", flush=True)
+        return
+    ref = None
+    next_live = next_retry = 0
+    while not stop.is_set() or not cloud_queue.empty():
+        try:
+            while True:
+                event = cloud_queue.get_nowait()
+                con.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)", (event["event_id"], json.dumps(event)))
+                con.commit()
+        except queue.Empty:
+            pass
+        except Exception as exc:
+            cloud_status = "LOCAL STORAGE ERROR"
+            print(f"[Firebase] Outbox error: {exc}", flush=True)
+            cloud_queue.put(event)
+            time.sleep(1)
+            continue
+        if stop.is_set(): break
+        now = time.monotonic()
+        if now >= next_retry:
+            try:
+                if ref is None:
+                    import firebase_admin
+                    from firebase_admin import credentials, db
+                    key = Path(FIREBASE_KEY)
+                    if not key.is_absolute(): key = Path(__file__).resolve().parent / key
+                    if not key.is_file():
+                        raise FileNotFoundError(f"Missing service account file: {key}")
+                    if not FIREBASE_URL.startswith("https://"):
+                        raise ValueError("Set FIREBASE_URL to your Realtime Database URL")
+                    try:
+                        app = firebase_admin.get_app()
+                    except ValueError:
+                        app = firebase_admin.initialize_app(credentials.Certificate(str(key)), {"databaseURL": FIREBASE_URL, "httpTimeout": 5})
+                    ref = db.reference(f"trains/{TRAIN_ID}", app=app)
+                # Stable event IDs make retries idempotent.
+                rows = con.execute("SELECT id, payload FROM outbox ORDER BY rowid LIMIT 20").fetchall()
+                if rows:
+                    ref.update({f"events/{eid}": json.loads(payload) for eid, payload in rows})
+                    con.executemany("DELETE FROM outbox WHERE id=?", [(eid,) for eid, _ in rows])
+                    con.commit()
+                if now >= next_live:
+                    with lock:
+                        snapshot = {cid: d.copy() for cid, d in latest.items()}
+                    updates = {}
+                    for cid in (1, 2):
+                        d = snapshot.get(cid, {})
+                        online = bool(d) and d["online"] and time.monotonic()-d["seen"] <= TIMEOUT
+                        state = {"coach_id": cid, "online": online, "port": f"/dev/ttyUSB{cid-1}", "uploaded_at": utc_now(), "server_timestamp_ms": {".sv": "timestamp"}, "stale": not online}
+                        if d:
+                            state.update({k: d[k] for k in ("temperature", "smoke", "emergency", "door_distance", "received_at")})
+                            state["conditions"] = sorted(conditions(d)) if online else []
+                            state["door_status"] = classify(d)["DOOR"][0] if online else "UNKNOWN"
+                            state["stale"] = not online
+                        updates[f"live_data/coach_{cid}"] = state
+                    ref.update(updates)
+                    next_live = time.monotonic() + LIVE_INTERVAL
+                if cloud_status != "ONLINE":
+                    print("[Firebase] Connected; live data and events syncing", flush=True)
+                cloud_status = "ONLINE"
+            except Exception as exc:
+                cloud_status = "OFFLINE / RETRYING"
+                print(f"[Firebase] {type(exc).__name__}: {exc}", flush=True)
+                next_retry = time.monotonic() + 5
+        stop.wait(0.2)
+    con.close()
 
 PORTS = {'/dev/ttyUSB0': 1, '/dev/ttyUSB1': 2}
 BAUD = 115200
@@ -45,8 +135,14 @@ def conditions(d):
     elif x > CLOSED_LIMIT: c.add('DOOR OPEN' if x >= OPEN_LIMIT else 'DOOR PARTIAL')
     return c
 
-def log(cid, message):
+def log(cid, message, data=None):
     history.appendleft((datetime.now().strftime('%H:%M:%S'), cid, message))
+    d = data if data is not None else latest.get(cid, {})
+    event = {"event_id": uuid.uuid4().hex, "coach_id": cid,
+             "event_type": message, "timestamp": utc_now(),
+             "port": f"/dev/ttyUSB{cid-1}",
+             "sensor_values": {k: d[k] for k in ("temperature", "smoke", "emergency", "door_distance", "sequence", "uptime_ms") if k in d}}
+    cloud_queue.put(event)
 
 def receive(port):
     cid = PORTS[port]
@@ -74,13 +170,13 @@ def receive(port):
                         old = latest.get(cid)
                         port_errors.pop(port, None)
                         if not old or not old['online'] or now-old['seen'] > TIMEOUT:
-                            log(cid, 'CONNECTED')
+                            log(cid, 'CONNECTED', d)
                         c = conditions(d)
                         p = previous.get(cid, set())
-                        for event in sorted(c-p): log(cid,event)
-                        for event in sorted(p-c): log(cid,event+' CLEARED')
+                        for event in sorted(c-p): log(cid,event,d)
+                        for event in sorted(p-c): log(cid,event+' CLEARED',d)
                         previous[cid] = c
-                        latest[cid] = dict(d, coach_id=cid, reported_id=reported_id, port=port, seen=now, online=True)
+                        latest[cid] = dict(d, coach_id=cid, reported_id=reported_id, port=port, seen=now, online=True, received_at=utc_now())
         except (serial.SerialException, OSError) as exc:
             report(port, str(exc))
             with lock:
@@ -194,10 +290,11 @@ class Dashboard:
                     txt(x+cw-13,yy,value,15,col,'e',True)
                 port = data[i]['port'].split('/')[-1] if on else f'ttyUSB{i-1} / No data'
                 txt(x+9,y+ch-10,port,10,MUTED)
+                if i == 2: txt(x+cw-9,y+ch-10,"DB: OK" if cloud_status == "ONLINE" else "DB: WAIT",9,GREEN if cloud_status == "ONLINE" else AMBER,"e")
         else:
             self.rows = max(1,(H-145)//24)
             self.offset = min(self.offset,max(0,len(events)-1))
-            txt(10,77,'EVENT HISTORY (RAM)',13,CYAN,bold=True)
+            txt(10,77,'EVENTS | DB: '+cloud_status,11,CYAN,bold=True)
             if not events: txt(12,108,'No events yet',12,MUTED)
             for j,(stamp,cid,msg) in enumerate(events[self.offset:self.offset+self.rows]):
                 yy=98+j*24
@@ -211,7 +308,13 @@ class Dashboard:
             button(x,H-38,x+b,H-3,label,action,self.page==action)
 
 if __name__ == '__main__':
+    worker = threading.Thread(target=cloud_worker, daemon=True)
+    worker.start()
     threading.Thread(target=discover,daemon=True).start()
     root=tk.Tk()
     Dashboard(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        stop.set()
+        worker.join(timeout=15)
