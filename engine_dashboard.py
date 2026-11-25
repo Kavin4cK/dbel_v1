@@ -7,7 +7,7 @@ from pathlib import Path
 import requests
 
 # Firebase Realtime Database configuration (public test database only)
-FIREBASE_URL = "PASTE_REALTIME_DATABASE_URL_HERE"
+FIREBASE_URL = "https://dbel-65121-default-rtdb.europe-west1.firebasedatabase.app/"
 TRAIN_ID = "train_001"
 LIVE_INTERVAL = 0.5  # seconds; latest state, not a new history entry each time
 OUTBOX_FILE = Path(__file__).resolve().with_name("firebase_outbox.sqlite3")
