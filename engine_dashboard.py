@@ -6,7 +6,7 @@ import uuid, sqlite3, queue
 from pathlib import Path
 
 # Firebase Realtime Database configuration
-FIREBASE_URL = "PASTE_REALTIME_DATABASE_URL_HERE"
+FIREBASE_URL = "https://dbel-65121-default-rtdb.europe-west1.firebasedatabase.app/"
 FIREBASE_KEY = Path(__file__).resolve().with_name("dbel.json")  # Service account JSON beside this script
 TRAIN_ID = "train_001"
 LIVE_INTERVAL = 0.5  # seconds; latest state, not a new history entry each time
