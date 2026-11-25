@@ -4,10 +4,10 @@ from collections import deque
 from datetime import datetime, timezone
 import uuid, sqlite3, queue, traceback
 from pathlib import Path
+import requests
 
-# Firebase Realtime Database configuration
-FIREBASE_URL = "https://dbel-65121-default-rtdb.europe-west1.firebasedatabase.app/"
-FIREBASE_KEY = Path(__file__).resolve().with_name("dbel.json")  # Service account JSON beside this script
+# Firebase Realtime Database configuration (public test database only)
+FIREBASE_URL = "PASTE_REALTIME_DATABASE_URL_HERE"
 TRAIN_ID = "train_001"
 LIVE_INTERVAL = 0.5  # seconds; latest state, not a new history entry each time
 OUTBOX_FILE = Path(__file__).resolve().with_name("firebase_outbox.sqlite3")
@@ -17,6 +17,28 @@ cloud_last_success = None
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+class FirebaseREST:
+    def __init__(self):
+        from urllib.parse import urlsplit
+        parsed = urlsplit(FIREBASE_URL)
+        if (parsed.scheme != 'https' or not parsed.hostname or
+            not parsed.hostname.endswith(('.firebaseio.com', '.firebasedatabase.app')) or
+            parsed.path not in ('', '/') or parsed.query or parsed.fragment or parsed.username):
+            raise ValueError("Set FIREBASE_URL to your Realtime Database root URL")
+        self.session = requests.Session()
+
+    def update(self, updates):
+        url = FIREBASE_URL.rstrip('/') + f'/trains/{TRAIN_ID}.json'
+        response = self.session.patch(url, json=updates, timeout=(4, 8))
+        if not response.ok:
+            if response.status_code in (401, 403):
+                raise RuntimeError(f'HTTP {response.status_code}: Permission denied; check database rules')
+            raise RuntimeError(f'Firebase HTTP {response.status_code}: {response.text[:200]}')
+
+    def close(self):
+        self.session.close()
+
 
 def cloud_worker():
     global cloud_status, cloud_last_success
@@ -49,25 +71,7 @@ def cloud_worker():
         if now >= next_retry:
             try:
                 if ref is None:
-                    import firebase_admin
-                    from firebase_admin import credentials, db
-                    key = Path(FIREBASE_KEY)
-                    if not key.is_absolute(): key = Path(__file__).resolve().parent / key
-                    if not key.is_file():
-                        raise FileNotFoundError(f"Missing service account file: {key}")
-                    with key.open(encoding="utf-8") as f:
-                        key_data = json.load(f)
-                    if not isinstance(key_data, dict) or key_data.get("type") != "service_account":
-                        raise ValueError("dbel.json must contain a service account private-key object, not null, an empty template or a web API key")
-                    if not all(isinstance(key_data.get(k), str) and key_data[k].strip() for k in ("project_id", "private_key", "client_email", "token_uri")):
-                        raise ValueError("dbel.json is missing required service account fields")
-                    if not FIREBASE_URL.startswith("https://"):
-                        raise ValueError("Set FIREBASE_URL to your Realtime Database URL")
-                    try:
-                        app = firebase_admin.get_app()
-                    except ValueError:
-                        app = firebase_admin.initialize_app(credentials.Certificate(str(key)), {"databaseURL": FIREBASE_URL, "httpTimeout": 5})
-                    ref = db.reference(f"trains/{TRAIN_ID}", app=app)
+                    ref = FirebaseREST()
                 # Stable event IDs make retries idempotent.
                 rows = con.execute("SELECT id, payload FROM outbox ORDER BY rowid LIMIT 20").fetchall()
                 if rows:
@@ -96,11 +100,13 @@ def cloud_worker():
                     next_live = time.monotonic() + LIVE_INTERVAL
             except Exception as exc:
                 cloud_status = "OFFLINE / RETRYING"
-                print(f"[Firebase] {type(exc).__name__}: {exc}", flush=True)
-                traceback.print_exc()
+                print(f"[Firebase] {type(exc).__name__}: " + ("Network request failed" if isinstance(exc, requests.RequestException) else str(exc)), flush=True)
+                # Avoid printing request URLs, which may contain authentication tokens.
+                if ref is not None: ref.close()
                 ref = None
                 next_retry = time.monotonic() + 5
         stop.wait(0.2)
+    if ref is not None: ref.close()
     con.close()
 
 PORTS = {'/dev/ttyUSB0': 1, '/dev/ttyUSB1': 2}
