@@ -3,7 +3,7 @@ import serial, threading, json, time, math, queue
 from collections import deque
 from datetime import datetime
 
-PORTS = ('/dev/ttyUSB2', '/dev/ttyUSB1')
+PORTS = ('/dev/ttyUSB0', '/dev/ttyUSB1')
 BAUD = 115200
 TEMP_LIMIT, SMOKE_LIMIT = 45, 400
 CLOSED_LIMIT, OPEN_LIMIT = 5, 10
