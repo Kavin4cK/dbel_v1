@@ -2,7 +2,7 @@ import tkinter as tk
 import serial, threading, json, time, math
 from collections import deque
 from datetime import datetime, timezone
-import uuid, sqlite3, queue
+import uuid, sqlite3, queue, traceback
 from pathlib import Path
 
 # Firebase Realtime Database configuration
@@ -55,6 +55,12 @@ def cloud_worker():
                     if not key.is_absolute(): key = Path(__file__).resolve().parent / key
                     if not key.is_file():
                         raise FileNotFoundError(f"Missing service account file: {key}")
+                    with key.open(encoding="utf-8") as f:
+                        key_data = json.load(f)
+                    if not isinstance(key_data, dict) or key_data.get("type") != "service_account":
+                        raise ValueError("dbel.json must contain a service account private-key object, not null, an empty template or a web API key")
+                    if not all(isinstance(key_data.get(k), str) and key_data[k].strip() for k in ("project_id", "private_key", "client_email", "token_uri")):
+                        raise ValueError("dbel.json is missing required service account fields")
                     if not FIREBASE_URL.startswith("https://"):
                         raise ValueError("Set FIREBASE_URL to your Realtime Database URL")
                     try:
@@ -91,6 +97,8 @@ def cloud_worker():
             except Exception as exc:
                 cloud_status = "OFFLINE / RETRYING"
                 print(f"[Firebase] {type(exc).__name__}: {exc}", flush=True)
+                traceback.print_exc()
+                ref = None
                 next_retry = time.monotonic() + 5
         stop.wait(0.2)
     con.close()
